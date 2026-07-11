@@ -5,6 +5,8 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+const KEY_ENTER: u8 = 36;
+
 struct WM {
     // Testing purposes for now
     display_target: String,
@@ -14,6 +16,8 @@ struct WM {
     clients: Vec<Window>,
     focused: Window,
 }
+
+const MAX_CLIENTS: usize = 256;
 
 impl WM {
     fn new() -> Self {
@@ -37,7 +41,7 @@ impl WM {
             display_target,
             conn,
             root,
-            clients: Vec::with_capacity(1024),
+            clients: Vec::with_capacity(MAX_CLIENTS),
             focused: root,
         }
     }
@@ -45,13 +49,21 @@ impl WM {
     fn handle_events(&mut self, event: Event) -> Result<(), Box<dyn std::error::Error>> {
         match event {
             Event::MapRequest(event) => {
-                self.conn.change_window_attributes(
-                    event.window,
-                    &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW),
-                )?;
+                if self.clients.len() < MAX_CLIENTS {
+                    self.clients.push(event.window);
 
-                self.conn.map_window(event.window)?;
-                self.clients.push(event.window);
+                    self.conn.change_window_attributes(
+                        event.window,
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW),
+                    )?;
+                    self.conn.map_window(event.window)?;
+                } else {
+                    eprintln!("There can only be {MAX_CLIENTS} clients at once.");
+
+                    self.conn.destroy_window(event.window)?;
+                }
+
+                self.conn.flush().ok();
 
                 tracing::info!("Clients = {}", self.clients.len());
             }
@@ -69,8 +81,12 @@ impl WM {
                 self.focused = event.event;
             }
 
+            Event::UnmapNotify(_) => {
+                todo!("IMPORTANT");
+            }
+
             Event::DestroyNotify(event) => {
-                if let Some(index) = self.clients.iter().position(|win| *win == event.window) {
+                if let Some(index) = self.clients.iter().position(|&win| win == event.window) {
                     self.clients.remove(index);
 
                     let win = if self.clients.is_empty() {
@@ -109,12 +125,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut wm = WM::new();
 
-    const ENTER_KEY_CODE: u8 = 36;
     wm.conn.grab_key(
         true,
         wm.root,
         ModMask::CONTROL,
-        ENTER_KEY_CODE,
+        KEY_ENTER,
         GrabMode::ASYNC,
         GrabMode::ASYNC,
     ).expect("should be able to grab key");
@@ -122,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         wm.conn.flush().ok();
 
-        let event = wm.conn.wait_for_event().expect("should receive event");
+        let event = wm.conn.wait_for_event().expect("shkjkjkjkould receive event");
         // TODO(fcasibu): handle errors
         wm.handle_events(event).unwrap();
     }
