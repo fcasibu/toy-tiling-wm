@@ -33,13 +33,13 @@ struct Client {
 }
 
 impl Client {
-    fn new(id: Window, x: i16, y: i16, width: u16, height: u16) -> Self {
+    fn new(id: Window) -> Self {
         Self {
             id,
-            x,
-            y,
-            width,
-            height,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
         }
     }
 }
@@ -54,7 +54,7 @@ struct WM {
     display_target: String,
 
     conn: RustConnection,
-    screen: Screen,
+    screen_num: usize,
     root: u32,
     clients: Vec<Client>,
     focused: Window,
@@ -65,8 +65,7 @@ struct WM {
 impl WM {
     fn new() -> Self {
         let display_target = std::env::var("DISPLAY").unwrap_or(String::from(":0"));
-        let (conn, screen_num) =
-            x11rb::connect(None).expect("should be able to connect to an x11 server");
+        let (conn, screen_num) = x11rb::connect(None).unwrap();
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
 
@@ -87,7 +86,7 @@ impl WM {
 
         Self {
             display_target,
-            screen: screen.clone(),
+            screen_num,
             conn,
             root,
             clients: Vec::with_capacity(MAX_CLIENTS),
@@ -103,8 +102,9 @@ impl WM {
             return Ok(());
         }
 
-        let screen_w = self.screen.width_in_pixels;
-        let screen_h = self.screen.height_in_pixels;
+        let screen = &self.conn.setup().roots[self.screen_num];
+        let screen_w = screen.width_in_pixels;
+        let screen_h = screen.height_in_pixels;
 
         for (index, client) in self.clients.iter_mut().enumerate() {
             let old = *client;
@@ -166,10 +166,14 @@ impl WM {
                 if self.clients.len() < MAX_CLIENTS {
                     self.conn.change_window_attributes(
                         client_id,
-                        &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW),
+                        &ChangeWindowAttributesAux::new()
+                            .event_mask(EventMask::ENTER_WINDOW | EventMask::LEAVE_WINDOW)
+                            .border_pixel(0x000000),
                     )?;
+                    self.conn
+                        .configure_window(client_id, &ConfigureWindowAux::new().border_width(2))?;
 
-                    let client = Client::new(client_id, 0, 0, 0, 0);
+                    let client = Client::new(client_id);
                     let focused_index = self.clients.iter().position(|c| c.id == self.focused);
 
                     if let Some(index) = focused_index
@@ -207,7 +211,6 @@ impl WM {
                         std::process::Command::new("firefox")
                             .env("DISPLAY", &self.display_target)
                             .spawn()?;
-                        self.should_relayout = true;
                     }
 
                     _ => {}
@@ -217,16 +220,28 @@ impl WM {
             Event::EnterNotify(event) => {
                 self.focused = event.event;
 
-                if let Ok(Ok(attr)) = self
-                    .conn
-                    .get_window_attributes(self.focused)
-                    .map(|r| r.reply())
-                    && attr.map_state != MapState::UNMAPPED
+                if event.detail != NotifyDetail::INFERIOR
+                    && let Some(client) = self.clients.iter_mut().find(|c| c.id == self.focused)
                 {
                     self.conn.set_input_focus(
                         InputFocus::PARENT,
-                        self.focused,
+                        client.id,
                         x11rb::CURRENT_TIME,
+                    )?;
+                    self.conn.change_window_attributes(
+                        client.id,
+                        &ChangeWindowAttributesAux::new().border_pixel(0x0000ff),
+                    )?;
+                }
+            }
+
+            Event::LeaveNotify(event) => {
+                if event.detail != NotifyDetail::INFERIOR
+                    && let Some(client) = self.clients.iter_mut().find(|c| c.id == self.focused)
+                {
+                    self.conn.change_window_attributes(
+                        client.id,
+                        &ChangeWindowAttributesAux::new().border_pixel(0x000000),
                     )?;
                 }
             }
@@ -250,6 +265,25 @@ impl WM {
     }
 }
 
+fn step(wm: &mut WM) -> Result<(), WMError> {
+    wm.conn.flush()?;
+
+    let event = wm.conn.wait_for_event()?;
+    let mut event_option = Some(event);
+
+    while let Some(event) = event_option {
+        wm.handle_events(event)?;
+        event_option = wm.conn.poll_for_event()?;
+    }
+
+    if wm.should_relayout {
+        wm.relayout()?;
+        wm.should_relayout = false;
+    }
+
+    Ok(())
+}
+
 fn main() {
     use tracing_subscriber::prelude::*;
 
@@ -259,6 +293,7 @@ fn main() {
 
     let mut wm = WM::new();
 
+    // TODO(fcasibu): just for testing, but should likely use grab_keyboard?
     wm.conn
         .grab_key(
             true,
@@ -281,19 +316,10 @@ fn main() {
         )
         .expect("should be able to grab key");
 
-    // TODO(fcasibu): handle errors
     loop {
-        wm.conn.flush().ok();
-
-        let event = wm.conn.wait_for_event().unwrap();
-        let mut event_option = Some(event);
-        while let Some(event) = event_option {
-            wm.handle_events(event).unwrap();
-            event_option = wm.conn.poll_for_event().unwrap();
-        }
-        if wm.should_relayout {
-            wm.relayout().unwrap();
-            wm.should_relayout = false;
+        if let Err(err) = step(&mut wm) {
+            tracing::error!(%err, "Error in WM loop");
+            std::process::exit(1);
         }
     }
 }
