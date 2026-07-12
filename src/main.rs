@@ -8,6 +8,7 @@ use x11rb::rust_connection::RustConnection;
 use thiserror::Error;
 
 const KEY_ENTER: u8 = 36;
+const KEY_E: u8 = 26;
 const MAX_CLIENTS: usize = 256;
 
 #[derive(Error, Debug)]
@@ -22,7 +23,7 @@ pub enum WMError {
     StandardError(#[from] std::io::Error),
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 struct Client {
     id: Window,
     x: i16,
@@ -41,10 +42,11 @@ impl Client {
             height,
         }
     }
+}
 
-    fn from_geometry(id: Window, geom: &GetGeometryReply) -> Self {
-        Self::new(id, geom.x, geom.y, geom.width, geom.height)
-    }
+enum Layout {
+    Split,
+    MasterStack,
 }
 
 struct WM {
@@ -56,6 +58,8 @@ struct WM {
     root: u32,
     clients: Vec<Client>,
     focused: Window,
+    layout: Layout,
+    should_relayout: bool,
 }
 
 impl WM {
@@ -88,30 +92,67 @@ impl WM {
             root,
             clients: Vec::with_capacity(MAX_CLIENTS),
             focused: root,
+            layout: Layout::MasterStack,
+            should_relayout: true,
         }
     }
 
     fn relayout(&mut self) -> Result<(), WMError> {
         let len = self.clients.len() as u16;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let screen_w = self.screen.width_in_pixels;
+        let screen_h = self.screen.height_in_pixels;
 
         for (index, client) in self.clients.iter_mut().enumerate() {
-            let new_width = self.screen.width_in_pixels / len;
-            client.width = new_width;
-            client.x = (new_width * index as u16) as i16;
+            let old = *client;
 
-            self.conn.configure_window(
-                client.id,
-                &ConfigureWindowAux::new()
-                    .width(client.width as u32)
-                    .height(client.height as u32)
-                    .x(client.x as i32),
-            )?;
+            match self.layout {
+                Layout::Split => {
+                    let new_width = screen_w / len;
+                    client.width = new_width;
+                    client.height = screen_h;
+                    client.x = (new_width * index as u16) as i16;
+                    client.y = 0;
+                }
 
-            self.conn.change_window_attributes(
-                client.id,
-                &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW),
-            )?;
-            self.conn.map_window(client.id)?;
+                Layout::MasterStack => {
+                    if len == 1 {
+                        client.width = screen_w;
+                        client.height = screen_h;
+                        client.x = 0;
+                        client.y = 0;
+                    } else {
+                        let half_width = screen_w / 2;
+                        client.width = half_width;
+
+                        if index == 0 {
+                            client.height = screen_h;
+                            client.x = 0;
+                            client.y = 0;
+                        } else {
+                            let stack_count = len - 1;
+                            let new_height = screen_h / stack_count;
+                            client.height = new_height;
+                            client.x = half_width as i16;
+                            client.y = (new_height * (index - 1) as u16) as i16;
+                        }
+                    }
+                }
+            }
+
+            if old != *client {
+                self.conn.configure_window(
+                    client.id,
+                    &ConfigureWindowAux::new()
+                        .width(client.width as u32)
+                        .height(client.height as u32)
+                        .x(client.x as i32)
+                        .y(client.y as i32),
+                )?;
+            }
         }
 
         Ok(())
@@ -123,85 +164,81 @@ impl WM {
                 let client_id = event.window;
 
                 if self.clients.len() < MAX_CLIENTS {
-                    self.conn.configure_window(
+                    self.conn.change_window_attributes(
                         client_id,
-                        &ConfigureWindowAux::new()
-                            .width(self.screen.width_in_pixels as u32)
-                            .height(self.screen.height_in_pixels as u32),
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW),
                     )?;
 
-                    let geom = self.conn.get_geometry(client_id)?.reply()?;
-                    self.clients.push(Client::from_geometry(client_id, &geom));
-                    self.relayout()?;
+                    let client = Client::new(client_id, 0, 0, 0, 0);
+                    let focused_index = self.clients.iter().position(|c| c.id == self.focused);
 
-                    for client in &self.clients {
-                        tracing::info!("{client:?}");
+                    if let Some(index) = focused_index
+                        && index + 1 < self.clients.len()
+                    {
+                        self.clients.insert(index + 1, client);
+                    } else {
+                        self.clients.push(client);
                     }
 
-                    self.conn.set_input_focus(
-                        InputFocus::PARENT,
-                        self.clients.last().map_or(self.root, |c| c.id),
-                        x11rb::CURRENT_TIME,
-                    )?;
+                    self.conn.map_window(client_id)?;
+                    self.should_relayout = true;
                 } else {
                     eprintln!("There can only be {MAX_CLIENTS} clients at once.");
 
                     self.conn.destroy_window(client_id)?;
                 }
 
-                self.conn.flush().ok();
-
                 tracing::info!("Clients = {}", self.clients.len());
             }
 
-            Event::KeyPress(_) => {
+            Event::KeyPress(event) => {
                 // Just test opening any window for now
-                std::process::Command::new("firefox")
-                    .env("DISPLAY", &self.display_target)
-                    .spawn()?;
+
+                match event.detail {
+                    KEY_E => {
+                        self.layout = match self.layout {
+                            Layout::Split => Layout::MasterStack,
+                            Layout::MasterStack => Layout::Split,
+                        };
+                        self.should_relayout = true;
+                    }
+
+                    KEY_ENTER => {
+                        std::process::Command::new("firefox")
+                            .env("DISPLAY", &self.display_target)
+                            .spawn()?;
+                        self.should_relayout = true;
+                    }
+
+                    _ => {}
+                }
             }
 
             Event::EnterNotify(event) => {
                 self.focused = event.event;
+
+                if let Ok(Ok(attr)) = self
+                    .conn
+                    .get_window_attributes(self.focused)
+                    .map(|r| r.reply())
+                    && attr.map_state != MapState::UNMAPPED
+                {
+                    self.conn.set_input_focus(
+                        InputFocus::PARENT,
+                        self.focused,
+                        x11rb::CURRENT_TIME,
+                    )?;
+                }
             }
 
             Event::UnmapNotify(event) => {
-                self.conn
-                    .set_input_focus(InputFocus::PARENT, self.root, x11rb::CURRENT_TIME)?;
-                self.focused = self.root;
-                tracing::info!(
-                    "Window = {}, Event = {}, from_configure = {}",
-                    event.window,
-                    event.event,
-                    event.from_configure
-                );
+                self.clients.retain(|c| c.id != event.window);
+                self.should_relayout = true;
             }
 
             Event::DestroyNotify(event) => {
-                if let Some(index) = self
-                    .clients
-                    .iter()
-                    .position(|client| client.id == event.window)
-                {
-                    self.clients.remove(index);
-
-                    let win = if self.clients.is_empty() {
-                        self.root
-                    } else {
-                        self.clients
-                            .get(index.saturating_sub(1))
-                            .expect("should not be out of bounds")
-                            .id
-                    };
-
-                    self.relayout()?;
-
-                    self.focused = win;
-                    self.conn
-                        .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)?;
-                }
-
-                tracing::info!("Clients = {}", self.clients.len());
+                self.clients.retain(|c| c.id != event.window);
+                self.should_relayout = true;
             }
 
             event => {
@@ -213,16 +250,12 @@ impl WM {
     }
 }
 
-fn init_tracing() {
+fn main() {
     use tracing_subscriber::prelude::*;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .init();
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
 
     let mut wm = WM::new();
 
@@ -237,15 +270,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .expect("should be able to grab key");
 
+    wm.conn
+        .grab_key(
+            true,
+            wm.root,
+            ModMask::CONTROL,
+            KEY_E,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .expect("should be able to grab key");
+
+    // TODO(fcasibu): handle errors
     loop {
         wm.conn.flush().ok();
 
         let event = wm.conn.wait_for_event().unwrap();
         let mut event_option = Some(event);
         while let Some(event) = event_option {
-            // TODO(fcasibu): handle errors
             wm.handle_events(event).unwrap();
             event_option = wm.conn.poll_for_event().unwrap();
+        }
+        if wm.should_relayout {
+            wm.relayout().unwrap();
+            wm.should_relayout = false;
         }
     }
 }
