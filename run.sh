@@ -2,7 +2,7 @@
 
 set -xe
 
-Xephyr -br -ac -noreset -glamor -screen 1280x720 :1 &
+Xephyr -br -ac -noreset -glamor -screen 1920x1080 :1 &
 XEPHYR_PID=$!
 
 cargo build || exit 1
