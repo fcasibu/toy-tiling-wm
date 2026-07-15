@@ -41,9 +41,11 @@ pub enum WMError {
     StandardError(#[from] std::io::Error),
 }
 
+#[derive(PartialEq, Copy, Clone)]
 enum Layout {
     Split,
     MasterStack,
+    Monocle,
 }
 
 impl Layout {
@@ -57,6 +59,13 @@ impl Layout {
                 client.width = new_width;
                 client.height = screen_h;
                 client.x = (new_width * index as u16) as i16;
+                client.y = 0;
+            }
+
+            Layout::Monocle => {
+                client.width = screen_w;
+                client.height = screen_h;
+                client.x = 0;
                 client.y = 0;
             }
 
@@ -124,6 +133,7 @@ struct WM {
     root: u32,
     clients: Vec<Client>,
     layout: Layout,
+    prev_layout: Layout,
     should_relayout: bool,
     pending_expose: HashSet<Window>,
 }
@@ -173,6 +183,7 @@ impl WM {
             clients: Vec::with_capacity(MAX_CLIENTS),
             pending_expose: HashSet::default(),
             layout: Layout::Split,
+            prev_layout: Layout::Split,
             should_relayout: true,
         })
     }
@@ -321,9 +332,20 @@ impl WM {
             let client_width = client.width.saturating_sub(BORDER_WIDTH);
             let client_height = client.height.saturating_sub(BORDER_WIDTH);
 
+            let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+            let is_focused =
+                focused_window == client.frame_window || focused_window == client.window;
+
+            let stack_mode = if is_focused {
+                StackMode::ABOVE
+            } else {
+                StackMode::BELOW
+            };
+
             self.conn.configure_window(
                 client.frame_window,
                 &ConfigureWindowAux::new()
+                    .stack_mode(stack_mode)
                     .width(client_width as u32)
                     .height(client_height as u32)
                     .x(client.x as i32)
@@ -399,6 +421,11 @@ impl WM {
         if let Some(client) = self.find_client_by_id(event.event) {
             self.conn
                 .set_input_focus(InputFocus::PARENT, client.window, x11rb::CURRENT_TIME)?;
+
+            self.conn.configure_window(
+                client.window,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
         }
 
         Ok(())
@@ -410,7 +437,7 @@ impl WM {
         }
 
         self.clients.retain(|c| {
-            if c.window != event.window {
+            if c.window != event.window && c.frame_window != event.window {
                 return true;
             }
 
@@ -422,19 +449,39 @@ impl WM {
             false
         });
 
+        if self.clients.is_empty() {
+            self.conn
+                .set_input_focus(InputFocus::PARENT, self.root, x11rb::CURRENT_TIME)?;
+        }
+
         self.should_relayout = true;
         Ok(())
     }
 
     fn handle_keypress_event(&mut self, event: KeyPressEvent) -> Result<(), WMError> {
-        // Just test opening any window for now
-
         match event.detail {
             KEY_E => {
+                if self.layout != Layout::Monocle {
+                    self.prev_layout = self.layout;
+                }
+
                 self.layout = match self.layout {
                     Layout::Split => Layout::MasterStack,
                     Layout::MasterStack => Layout::Split,
+                    Layout::Monocle => Layout::MasterStack,
                 };
+
+                self.should_relayout = true;
+            }
+
+            KEY_F => {
+                self.layout = if self.layout == Layout::Monocle {
+                    self.prev_layout
+                } else {
+                    self.prev_layout = self.layout;
+                    Layout::Monocle
+                };
+
                 self.should_relayout = true;
             }
 
