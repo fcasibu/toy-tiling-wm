@@ -16,7 +16,12 @@ use std::collections::HashSet;
 
 const KEY_ENTER: u8 = 36;
 const KEY_E: u8 = 26;
+const KEY_Q: u8 = 24;
 const KEY_F: u8 = 41;
+const KEY_H: u8 = 43;
+const KEY_J: u8 = 44;
+const KEY_K: u8 = 45;
+const KEY_L: u8 = 46;
 const MAX_CLIENTS: usize = 256;
 const TITLEBAR_HEIGHT: u16 = 28;
 const BG_COLOR: u32 = 0x2B3E75F;
@@ -96,6 +101,13 @@ impl Layout {
     }
 }
 
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /* ---------------------------------------------------------- */
 /*                          STRUCTS                           */
 /* ---------------------------------------------------------- */
@@ -132,10 +144,12 @@ struct WM {
     screen_num: usize,
     root: u32,
     clients: Vec<Client>,
+    floating_clients: Vec<Client>,
     layout: Layout,
     prev_layout: Layout,
     should_relayout: bool,
     pending_expose: HashSet<Window>,
+    dragged_window: Option<(Window, (i16, i16))>,
 }
 
 impl WM {
@@ -181,11 +195,158 @@ impl WM {
             conn,
             root,
             clients: Vec::with_capacity(MAX_CLIENTS),
+            floating_clients: Vec::with_capacity(MAX_CLIENTS),
             pending_expose: HashSet::default(),
             layout: Layout::Split,
             prev_layout: Layout::Split,
             should_relayout: true,
+            dragged_window: None,
         })
+    }
+
+    fn step(&mut self) -> Result<(), WMError> {
+        self.refresh()?;
+        self.conn.flush()?;
+
+        let event = self.conn.wait_for_event()?;
+        let mut event_option = Some(event);
+
+        while let Some(event) = event_option {
+            self.handle_events(event)?;
+            event_option = self.conn.poll_for_event()?;
+        }
+
+        if self.should_relayout {
+            self.relayout()?;
+            self.should_relayout = false;
+        }
+
+        Ok(())
+    }
+
+    fn init_keymaps(&self) -> Result<(), WMError> {
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_ENTER,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_Q,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_E,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_F,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL | ModMask::SHIFT,
+            KEY_F,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_H,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_L,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_J,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+        self.conn.grab_key(
+            true,
+            self.root,
+            ModMask::CONTROL,
+            KEY_K,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        Ok(())
+    }
+
+    fn get_focused_client(&self) -> Result<Option<&Client>, WMError> {
+        let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+        Ok(self.find_client_by_id(focused_window))
+    }
+
+    fn focus_direction(&self, dir: Direction, time: Timestamp) -> Result<(), WMError> {
+        if let Some(client) = self.get_focused_client()? {
+            let (fx, fy) = center(client);
+
+            let window = self
+                .clients
+                .iter()
+                .filter(|c| c.window != client.window)
+                .filter(|c| {
+                    let (cx, cy) = center(c);
+
+                    match dir {
+                        Direction::Left => cx < fx,
+                        Direction::Right => cx > fx,
+                        Direction::Up => cy < fy,
+                        Direction::Down => cy > fy,
+                    }
+                })
+                .min_by_key(|c| {
+                    let (cx, cy) = center(c);
+                    match dir {
+                        Direction::Left | Direction::Right => (cx - fx).abs() + (cy - fy).abs() * 2,
+                        Direction::Up | Direction::Down => (cy - fy).abs() + (cx - fx).abs() * 2,
+                    }
+                })
+                .map(|c| c.window);
+
+            if let Some(window) = window {
+                self.conn
+                    .set_input_focus(InputFocus::PARENT, window, time)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn draw_titlebar(&self, client: &Client) -> Result<(), WMError> {
@@ -249,6 +410,13 @@ impl WM {
         self.clients
             .iter()
             .find(|c| c.window == id || c.frame_window == id)
+            .or_else(|| self.find_floating_client_by_id(id))
+    }
+
+    fn find_floating_client_by_id(&self, id: Window) -> Option<&Client> {
+        self.floating_clients
+            .iter()
+            .find(|c| c.window == id || c.frame_window == id)
     }
 
     fn create_frame_window(&self, geom: &GetGeometryReply) -> Result<Window, WMError> {
@@ -275,7 +443,10 @@ impl WM {
                     EventMask::EXPOSURE
                         | EventMask::SUBSTRUCTURE_NOTIFY
                         | EventMask::SUBSTRUCTURE_REDIRECT
-                        | EventMask::ENTER_WINDOW,
+                        | EventMask::ENTER_WINDOW
+                        | EventMask::POINTER_MOTION
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE,
                 ),
         )?;
 
@@ -332,20 +503,9 @@ impl WM {
             let client_width = client.width.saturating_sub(BORDER_WIDTH);
             let client_height = client.height.saturating_sub(BORDER_WIDTH);
 
-            let focused_window = self.conn.get_input_focus()?.reply()?.focus;
-            let is_focused =
-                focused_window == client.frame_window || focused_window == client.window;
-
-            let stack_mode = if is_focused {
-                StackMode::ABOVE
-            } else {
-                StackMode::BELOW
-            };
-
             self.conn.configure_window(
                 client.frame_window,
                 &ConfigureWindowAux::new()
-                    .stack_mode(stack_mode)
                     .width(client_width as u32)
                     .height(client_height as u32)
                     .x(client.x as i32)
@@ -377,6 +537,9 @@ impl WM {
             Event::KeyPress(event) => self.handle_keypress_event(event)?,
             Event::EnterNotify(event) => self.handle_enter_notify_event(event)?,
             Event::UnmapNotify(event) => self.handle_unmap_notify_event(event)?,
+            Event::MotionNotify(event) => self.handle_motion_notify_event(event)?,
+            Event::ButtonPress(event) => self.handle_button_press_event(event)?,
+            Event::ButtonRelease(event) => self.handle_button_release_event(event)?,
 
             event => tracing::info!("{event:?}"),
         }
@@ -421,11 +584,6 @@ impl WM {
         if let Some(client) = self.find_client_by_id(event.event) {
             self.conn
                 .set_input_focus(InputFocus::PARENT, client.window, x11rb::CURRENT_TIME)?;
-
-            self.conn.configure_window(
-                client.window,
-                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-            )?;
         }
 
         Ok(())
@@ -449,12 +607,64 @@ impl WM {
             false
         });
 
-        if self.clients.is_empty() {
+        self.floating_clients.retain(|c| {
+            if c.window != event.window && c.frame_window != event.window {
+                return true;
+            }
+
+            self.conn
+                .reparent_window(c.window, self.root, c.x, c.y)
+                .unwrap();
+            self.conn.destroy_window(c.frame_window).unwrap();
+
+            false
+        });
+
+        if self.clients.is_empty() && self.floating_clients.is_empty() {
             self.conn
                 .set_input_focus(InputFocus::PARENT, self.root, x11rb::CURRENT_TIME)?;
         }
 
         self.should_relayout = true;
+        Ok(())
+    }
+
+    fn handle_motion_notify_event(&mut self, event: MotionNotifyEvent) -> Result<(), WMError> {
+        if event.state == KeyButMask::BUTTON1
+            && let Some((window, (offset_x, offset_y))) = self.dragged_window
+        {
+            self.conn.configure_window(
+                window,
+                &ConfigureWindowAux::new()
+                    .x((offset_x + event.root_x) as i32)
+                    .y((offset_y + event.root_y) as i32),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_button_press_event(&mut self, event: ButtonPressEvent) -> Result<(), WMError> {
+        if event.detail != 1 {
+            return Ok(());
+        }
+
+        if let Some(floating_client) = self.find_floating_client_by_id(event.event) {
+            {
+                let (x, y) = (-event.event_x, -event.event_y);
+
+                self.dragged_window = Some((floating_client.frame_window, (x, y)));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_button_release_event(&mut self, event: ButtonReleaseEvent) -> Result<(), WMError> {
+        if event.detail == 1 {
+            self.dragged_window = None;
+        }
+
         Ok(())
     }
 
@@ -475,6 +685,84 @@ impl WM {
             }
 
             KEY_F => {
+                if event
+                    .state
+                    .contains(KeyButMask::SHIFT | KeyButMask::CONTROL)
+                {
+                    let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+                    if focused_window == self.root {
+                        return Ok(());
+                    }
+
+                    if let Some(index) = self.floating_clients.iter_mut().position(|c| {
+                        c.window == focused_window || c.frame_window == focused_window
+                    }) {
+                        if self.clients.len() >= MAX_CLIENTS {
+                            return Ok(());
+                        }
+
+                        let client = self.floating_clients.swap_remove(index);
+                        self.clients.push(client);
+                        self.should_relayout = true;
+
+                        return Ok(());
+                    }
+
+                    self.clients.retain(|c| {
+                        if c.frame_window == focused_window || c.window == focused_window {
+                            self.floating_clients.push(*c);
+                            assert!(self.floating_clients.len() <= MAX_CLIENTS);
+                            return false;
+                        }
+
+                        true
+                    });
+
+                    self.should_relayout = true;
+
+                    let Some(floating_client) = self.floating_clients.last_mut() else {
+                        return Ok(());
+                    };
+
+                    let setup = self.conn.setup();
+                    assert!(self.screen_num < setup.roots.len());
+                    let screen = &setup.roots[self.screen_num];
+
+                    let client_width = screen.width_in_pixels / 2;
+                    let client_height = screen.height_in_pixels / 2;
+
+                    floating_client.width = client_width;
+                    floating_client.height = client_height;
+                    floating_client.x = (client_width as i16) / 2;
+                    floating_client.y = (client_height as i16) / 2;
+
+                    self.conn.configure_window(
+                        floating_client.frame_window,
+                        &ConfigureWindowAux::new()
+                            .stack_mode(StackMode::ABOVE)
+                            .width(client_width as u32)
+                            .height(client_height as u32)
+                            .x(floating_client.x as i32)
+                            .y(floating_client.y as i32),
+                    )?;
+
+                    self.conn.configure_window(
+                        floating_client.window,
+                        &ConfigureWindowAux::new()
+                            .width(client_width as u32)
+                            .height(client_height.saturating_sub(TITLEBAR_HEIGHT) as u32)
+                            .x(0)
+                            .y(TITLEBAR_HEIGHT as i32),
+                    )?;
+                    self.conn.set_input_focus(
+                        InputFocus::PARENT,
+                        floating_client.window,
+                        event.time,
+                    )?;
+
+                    return Ok(());
+                }
+
                 self.layout = if self.layout == Layout::Monocle {
                     self.prev_layout
                 } else {
@@ -491,6 +779,15 @@ impl WM {
                     .spawn()?;
             }
 
+            KEY_Q => {
+                std::process::Command::new("pkill").arg("Xephyr").output()?;
+            }
+
+            KEY_H => self.focus_direction(Direction::Left, event.time)?,
+            KEY_L => self.focus_direction(Direction::Right, event.time)?,
+            KEY_J => self.focus_direction(Direction::Down, event.time)?,
+            KEY_K => self.focus_direction(Direction::Up, event.time)?,
+
             _ => {}
         }
 
@@ -498,24 +795,15 @@ impl WM {
     }
 }
 
-fn step(wm: &mut WM) -> Result<(), WMError> {
-    wm.refresh()?;
-    wm.conn.flush()?;
+/* ---------------------------------------------------------- */
+/*                         FUNCTIONS                          */
+/* ---------------------------------------------------------- */
 
-    let event = wm.conn.wait_for_event()?;
-    let mut event_option = Some(event);
-
-    while let Some(event) = event_option {
-        wm.handle_events(event)?;
-        event_option = wm.conn.poll_for_event()?;
-    }
-
-    if wm.should_relayout {
-        wm.relayout()?;
-        wm.should_relayout = false;
-    }
-
-    Ok(())
+fn center(client: &Client) -> (i16, i16) {
+    (
+        client.x.saturating_add(client.width as i16 / 2),
+        client.y.saturating_add(client.height as i16 / 2),
+    )
 }
 
 fn main() {
@@ -527,45 +815,17 @@ fn main() {
 
     let mut wm = WM::new().unwrap();
     wm.scan_and_manage_windows().unwrap();
-
-    // TODO(fcasibu): just for testing, but should likely use grab_keyboard?
-    wm.conn
-        .grab_key(
-            true,
-            wm.root,
-            ModMask::CONTROL,
-            KEY_ENTER,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        )
-        .expect("should be able to grab key");
-
-    wm.conn
-        .grab_key(
-            true,
-            wm.root,
-            ModMask::CONTROL,
-            KEY_E,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        )
-        .expect("should be able to grab key");
-
-    wm.conn
-        .grab_key(
-            true,
-            wm.root,
-            ModMask::CONTROL,
-            KEY_F,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        )
-        .expect("should be able to grab key");
+    // TODO(fcasibu): Make use of table for configuration
+    wm.init_keymaps().unwrap();
 
     loop {
-        if let Err(err) = step(&mut wm) {
+        if let Err(err) = wm.step() {
             tracing::error!(%err, "Error in WM loop");
             std::process::exit(1);
         }
     }
 }
+
+/* ---------------------------------------------------------- */
+/*                      QUERIES/THOUGHTS                      */
+/* ---------------------------------------------------------- */
