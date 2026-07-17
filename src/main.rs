@@ -314,36 +314,38 @@ impl WM {
     }
 
     fn focus_direction(&self, dir: Direction, time: Timestamp) -> Result<(), WMError> {
-        if let Some(client) = self.get_focused_client()? {
-            let (fx, fy) = center(client);
+        let Some(client) = self.get_focused_client()? else {
+            return Ok(());
+        };
 
-            let window = self
-                .clients
-                .iter()
-                .filter(|c| c.window != client.window)
-                .filter(|c| {
-                    let (cx, cy) = center(c);
+        let (fx, fy) = center(client);
 
-                    match dir {
-                        Direction::Left => cx < fx,
-                        Direction::Right => cx > fx,
-                        Direction::Up => cy < fy,
-                        Direction::Down => cy > fy,
-                    }
-                })
-                .min_by_key(|c| {
-                    let (cx, cy) = center(c);
-                    match dir {
-                        Direction::Left | Direction::Right => (cx - fx).abs() + (cy - fy).abs() * 2,
-                        Direction::Up | Direction::Down => (cy - fy).abs() + (cx - fx).abs() * 2,
-                    }
-                })
-                .map(|c| c.window);
+        let window = self
+            .clients
+            .iter()
+            .filter(|c| c.window != client.window)
+            .filter(|c| {
+                let (cx, cy) = center(c);
 
-            if let Some(window) = window {
-                self.conn
-                    .set_input_focus(InputFocus::PARENT, window, time)?;
-            }
+                match dir {
+                    Direction::Left => cx < fx,
+                    Direction::Right => cx > fx,
+                    Direction::Up => cy < fy,
+                    Direction::Down => cy > fy,
+                }
+            })
+            .min_by_key(|c| {
+                let (cx, cy) = center(c);
+                match dir {
+                    Direction::Left | Direction::Right => (cx - fx).abs() + (cy - fy).abs() * 2,
+                    Direction::Up | Direction::Down => (cy - fy).abs() + (cx - fx).abs() * 2,
+                }
+            })
+            .map(|c| c.window);
+
+        if let Some(window) = window {
+            self.conn
+                .set_input_focus(InputFocus::PARENT, window, time)?;
         }
 
         Ok(())
@@ -396,9 +398,11 @@ impl WM {
         while let Some(&win) = self.pending_expose.iter().next() {
             self.pending_expose.remove(&win);
 
-            if let Some(client) = self.find_client_by_id(win)
-                && let Err(err) = self.draw_titlebar(client)
-            {
+            let Some(client) = self.find_client_by_id(win) else {
+                continue;
+            };
+
+            if let Err(err) = self.draw_titlebar(client) {
                 tracing::error!(%err, "Failed to draw titlebar.");
             }
         }
@@ -554,14 +558,16 @@ impl WM {
     }
 
     fn handle_configure_request_event(&self, event: ConfigureRequestEvent) -> Result<(), WMError> {
-        if self.find_client_by_id(event.window).is_none() {
-            self.conn.configure_window(
-                event.window,
-                &ConfigureWindowAux::from_configure_request(&event)
-                    .stack_mode(None)
-                    .sibling(None),
-            )?;
+        if self.find_client_by_id(event.window).is_some() {
+            return Ok(());
         }
+
+        self.conn.configure_window(
+            event.window,
+            &ConfigureWindowAux::from_configure_request(&event)
+                .stack_mode(None)
+                .sibling(None),
+        )?;
 
         Ok(())
     }
@@ -584,7 +590,7 @@ impl WM {
         if let Some(client) = self.find_client_by_id(event.event) {
             self.conn
                 .set_input_focus(InputFocus::PARENT, client.window, x11rb::CURRENT_TIME)?;
-        }
+        };
 
         Ok(())
     }
@@ -630,16 +636,20 @@ impl WM {
     }
 
     fn handle_motion_notify_event(&mut self, event: MotionNotifyEvent) -> Result<(), WMError> {
-        if event.state == KeyButMask::BUTTON1
-            && let Some((window, (offset_x, offset_y))) = self.dragged_window
-        {
-            self.conn.configure_window(
-                window,
-                &ConfigureWindowAux::new()
-                    .x((offset_x + event.root_x) as i32)
-                    .y((offset_y + event.root_y) as i32),
-            )?;
+        if event.state != KeyButMask::BUTTON1 {
+            return Ok(());
         }
+
+        let Some((window, (offset_x, offset_y))) = self.dragged_window else {
+            return Ok(());
+        };
+
+        self.conn.configure_window(
+            window,
+            &ConfigureWindowAux::new()
+                .x((offset_x + event.root_x) as i32)
+                .y((offset_y + event.root_y) as i32),
+        )?;
 
         Ok(())
     }
@@ -649,13 +659,12 @@ impl WM {
             return Ok(());
         }
 
-        if let Some(floating_client) = self.find_floating_client_by_id(event.event) {
-            {
-                let (x, y) = (-event.event_x, -event.event_y);
+        let Some(floating_client) = self.find_floating_client_by_id(event.event) else {
+            return Ok(());
+        };
 
-                self.dragged_window = Some((floating_client.frame_window, (x, y)));
-            }
-        }
+        let (x, y) = (-event.event_x, -event.event_y);
+        self.dragged_window = Some((floating_client.frame_window, (x, y)));
 
         Ok(())
     }
@@ -685,92 +694,93 @@ impl WM {
             }
 
             KEY_F => {
-                if event
+                if !event
                     .state
                     .contains(KeyButMask::SHIFT | KeyButMask::CONTROL)
                 {
-                    let focused_window = self.conn.get_input_focus()?.reply()?.focus;
-                    if focused_window == self.root {
-                        return Ok(());
-                    }
-
-                    if let Some(index) = self.floating_clients.iter_mut().position(|c| {
-                        c.window == focused_window || c.frame_window == focused_window
-                    }) {
-                        if self.clients.len() >= MAX_CLIENTS {
-                            return Ok(());
-                        }
-
-                        let client = self.floating_clients.swap_remove(index);
-                        self.clients.push(client);
-                        self.should_relayout = true;
-
-                        return Ok(());
-                    }
-
-                    self.clients.retain(|c| {
-                        if c.frame_window == focused_window || c.window == focused_window {
-                            self.floating_clients.push(*c);
-                            assert!(self.floating_clients.len() <= MAX_CLIENTS);
-                            return false;
-                        }
-
-                        true
-                    });
-
-                    self.should_relayout = true;
-
-                    let Some(floating_client) = self.floating_clients.last_mut() else {
-                        return Ok(());
+                    self.layout = if self.layout == Layout::Monocle {
+                        self.prev_layout
+                    } else {
+                        self.prev_layout = self.layout;
+                        Layout::Monocle
                     };
 
-                    let setup = self.conn.setup();
-                    assert!(self.screen_num < setup.roots.len());
-                    let screen = &setup.roots[self.screen_num];
+                    self.should_relayout = true;
+                    return Ok(());
+                }
 
-                    let client_width = screen.width_in_pixels / 2;
-                    let client_height = screen.height_in_pixels / 2;
+                let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+                if focused_window == self.root {
+                    return Ok(());
+                }
 
-                    floating_client.width = client_width;
-                    floating_client.height = client_height;
-                    floating_client.x = (client_width as i16) / 2;
-                    floating_client.y = (client_height as i16) / 2;
+                if let Some(index) = self
+                    .floating_clients
+                    .iter_mut()
+                    .position(|c| c.window == focused_window || c.frame_window == focused_window)
+                {
+                    if self.clients.len() >= MAX_CLIENTS {
+                        return Ok(());
+                    }
 
-                    self.conn.configure_window(
-                        floating_client.frame_window,
-                        &ConfigureWindowAux::new()
-                            .stack_mode(StackMode::ABOVE)
-                            .width(client_width as u32)
-                            .height(client_height as u32)
-                            .x(floating_client.x as i32)
-                            .y(floating_client.y as i32),
-                    )?;
-
-                    self.conn.configure_window(
-                        floating_client.window,
-                        &ConfigureWindowAux::new()
-                            .width(client_width as u32)
-                            .height(client_height.saturating_sub(TITLEBAR_HEIGHT) as u32)
-                            .x(0)
-                            .y(TITLEBAR_HEIGHT as i32),
-                    )?;
-                    self.conn.set_input_focus(
-                        InputFocus::PARENT,
-                        floating_client.window,
-                        event.time,
-                    )?;
+                    let client = self.floating_clients.swap_remove(index);
+                    self.clients.push(client);
+                    self.should_relayout = true;
 
                     return Ok(());
                 }
 
-                self.layout = if self.layout == Layout::Monocle {
-                    self.prev_layout
-                } else {
-                    self.prev_layout = self.layout;
-                    Layout::Monocle
-                };
+                self.clients.retain(|c| {
+                    if c.frame_window == focused_window || c.window == focused_window {
+                        self.floating_clients.push(*c);
+                        assert!(self.floating_clients.len() <= MAX_CLIENTS);
+                        return false;
+                    }
+
+                    true
+                });
 
                 self.should_relayout = true;
+
+                let Some(floating_client) = self.floating_clients.last_mut() else {
+                    return Ok(());
+                };
+
+                let setup = self.conn.setup();
+                assert!(self.screen_num < setup.roots.len());
+                let screen = &setup.roots[self.screen_num];
+
+                let client_width = screen.width_in_pixels / 2;
+                let client_height = screen.height_in_pixels / 2;
+
+                floating_client.width = client_width;
+                floating_client.height = client_height;
+                floating_client.x = (client_width as i16) / 2;
+                floating_client.y = (client_height as i16) / 2;
+
+                self.conn.configure_window(
+                    floating_client.frame_window,
+                    &ConfigureWindowAux::new()
+                        .stack_mode(StackMode::ABOVE)
+                        .width(client_width as u32)
+                        .height(client_height as u32)
+                        .x(floating_client.x as i32)
+                        .y(floating_client.y as i32),
+                )?;
+
+                self.conn.configure_window(
+                    floating_client.window,
+                    &ConfigureWindowAux::new()
+                        .width(client_width as u32)
+                        .height(client_height.saturating_sub(TITLEBAR_HEIGHT) as u32)
+                        .x(0)
+                        .y(TITLEBAR_HEIGHT as i32),
+                )?;
+                self.conn.set_input_focus(
+                    InputFocus::PARENT,
+                    floating_client.window,
+                    event.time,
+                )?;
             }
 
             KEY_ENTER => {
